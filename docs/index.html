@@ -157,7 +157,7 @@ function render() {
   const planned = S.items.filter(i => i.day).length, ideas = S.items.length - planned;
   const nd = new Date(); const def = iso(nd);
   app.innerHTML = `<header><h1>Weekend plans</h1>
-    <p class="sum">${shown.length} day${shown.length === 1 ? '' : 's'} ahead · ${planned} planned · ${ideas} idea${ideas === 1 ? '' : 's'} waiting</p>
+    <p class="sum">${shown.length} day${shown.length === 1 ? '' : 's'} ahead · ${planned} planned · ${ideas} idea${ideas === 1 ? '' : 's'} waiting<span id="sync">${syncText()}</span></p>
     <form class="addday" id="addday"><input type="date" name="date" value="${def}" aria-label="Date" required>
       <select name="type" aria-label="Kind of day"><option value="weekend">Weekend</option><option value="holiday">Holiday</option><option value="off">Day off</option></select>
       <input class="lbl" name="label" placeholder="Name (optional), e.g. Christmas" aria-label="Name">
@@ -187,11 +187,51 @@ function schedulePublish() {
   }, 2500);
 }
 
+/* ---- sync with the home server, when served by server.py (off on GitHub Pages / file://) ---- */
+const API = 'api/state';
+let sync = null, pushTimer = 0, pulling = false;
+const syncText = () => sync === 'ok' ? ' · Synced' : sync === 'offline' ? ' · Offline, saved on this device' : '';
+function setSync(v) { sync = v; const el = document.getElementById('sync'); if (el) el.textContent = syncText(); }
+const busy = () => { const a = document.activeElement; return drag || (a && (a.tagName === 'SELECT' || (a.tagName === 'INPUT' && (a.value || !a.closest('.add'))))); };
+function adopt(R) {
+  const f = document.activeElement && document.activeElement.closest && document.activeElement.closest('.add');
+  if (f) refocus = f.dataset.day;
+  S = R; undoSnap = null; toast.classList.remove('on');
+  try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) {}
+  render();
+}
+async function pull() {
+  if (pulling) return;
+  pulling = true;
+  try {
+    const res = await fetch(API, {cache: 'no-store'});
+    if (!res.ok) { if (sync) setSync('offline'); return; }
+    const R = (await res.json()).state;
+    setSync('ok');
+    if (!R || S.t > R.t) push(0);
+    else if (R.t > S.t && !busy()) adopt(R);
+  } catch (e) { if (sync) setSync('offline'); }
+  finally { pulling = false; }
+}
+function push(delay = 400) {
+  if (!sync) return;
+  clearTimeout(pushTimer);
+  pushTimer = setTimeout(async () => {
+    try {
+      const res = await fetch(API, {method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(S)});
+      if (res.status === 409) { const R = (await res.json()).state; if (R && R.t > S.t) adopt(R); }
+      else if (!res.ok) throw new Error(res.status);
+      setSync('ok');
+    } catch (e) { setSync('offline'); }
+  }, delay);
+}
+
 function commit(msg) {
   S.t = Date.now();
   try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) {}
   render();
   schedulePublish();
+  push();
   if (msg) showToast(msg);
 }
 function snap() { undoSnap = JSON.stringify(S); }
@@ -316,6 +356,10 @@ window.addEventListener('pointercancel', endDrag);
 
 render();
 if (window.claude && window.claude.use) window.claude.use('artifact').then(a => { art = a; }).catch(() => {});
+
+pull();
+setInterval(() => { if (sync && document.visibilityState === 'visible') pull(); }, 5000);
+document.addEventListener('visibilitychange', () => { if (sync && document.visibilityState === 'visible') pull(); });
 
 if ('serviceWorker' in navigator) {
   const hadController = !!navigator.serviceWorker.controller;

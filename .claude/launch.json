@@ -2,9 +2,9 @@
   "version": "0.0.1",
   "configurations": [
     {
-      "name": "pwa",
+      "name": "sync",
       "runtimeExecutable": "python",
-      "runtimeArgs": ["-m", "http.server", "8090", "--directory", "docs"],
+      "runtimeArgs": ["server.py"],
       "port": 8090
     }
   ]
