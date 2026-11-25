@@ -1,0 +1,17 @@
+[Unit]
+Description=Weekend Plans sync server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=pi
+WorkingDirectory=/home/pi/weekend-planner
+Environment=PORT=80
+ExecStart=/usr/bin/python3 -u /home/pi/weekend-planner/server.py
+Restart=always
+RestartSec=3
+# Lets the non-root pi user listen on port 80.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target
