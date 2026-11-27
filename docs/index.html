@@ -101,6 +101,9 @@ const toast = document.getElementById('toast');
 
 let S = JSON.parse(document.getElementById('state').textContent);
 try { const L = JSON.parse(localStorage.getItem(KEY)); if (L && L.t > S.t) S = L; } catch (e) {}
+// A copy saved before per-plan merging (no S.gone) gets matched against the server once, on the first sync.
+let legacy = S.gone ? null : JSON.parse(JSON.stringify(S));
+S = normalize(S);
 
 let showPast = false, undoSnap = null, toastTimer = 0, refocus = null, pubTimer = 0, art = null, canPub = true;
 
@@ -110,6 +113,10 @@ const parse = s => { const [y, m, d] = s.split('-').map(Number); return new Date
 const iso = d => d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
 const today = () => { const d = new Date(); d.setHours(0, 0, 0, 0); return d; };
 const diff = s => Math.round((parse(s) - today()) / 864e5);
+const touch = r => { r.u = Date.now(); return r; };
+function kill(kind, id) { S.gone[id] = Date.now(); S[kind] = S[kind].filter(r => r.id !== id); }
+const nextO = day => Math.max(-1, ...S.items.filter(i => i.day === day).map(i => i.o)) + 1;
+const byOrder = (a, b) => a.o - b.o || (a.id < b.id ? -1 : 1);
 
 function rel(s) {
   const n = diff(s);
@@ -126,7 +133,7 @@ const checkSVG = done => done
 function itemHTML(it) {
   return `<li class="item${it.done ? ' done' : ''}" data-id="${it.id}"><span class="grip" title="Drag"><svg width="12" height="18" viewBox="0 0 12 18" fill="currentColor"><circle cx="3" cy="3" r="1.6"/><circle cx="9" cy="3" r="1.6"/><circle cx="3" cy="9" r="1.6"/><circle cx="9" cy="9" r="1.6"/><circle cx="3" cy="15" r="1.6"/><circle cx="9" cy="15" r="1.6"/></svg></span><span class="txt">${esc(it.text)}</span><button class="chk${it.done ? ' done' : ''}" data-act="toggleitem" aria-pressed="${it.done ? 'true' : 'false'}" aria-label="${it.done ? 'Mark not done' : 'Mark done'}">${checkSVG(it.done)}</button><button class="x" data-act="delitem" aria-label="Delete plan">×</button></li>`;
 }
-const listHTML = day => `<ul class="list" data-day="${day || ''}">${S.items.filter(i => i.day === day).map(itemHTML).join('')}</ul>`;
+const listHTML = day => `<ul class="list" data-day="${day || ''}">${S.items.filter(i => i.day === day).sort(byOrder).map(itemHTML).join('')}</ul>`;
 const addHTML = (day, ph) => `<form class="add" data-day="${day || ''}"><input name="t" placeholder="${ph}" aria-label="${ph}" autocomplete="off"><button class="btn">Add</button></form>`;
 
 function dayHTML(d) {
@@ -187,17 +194,63 @@ function schedulePublish() {
   }, 2500);
 }
 
-/* ---- sync with the home server, when served by server.py (off on GitHub Pages / file://) ---- */
-const API = 'api/state';
+/* ---- sync with the home server (server.py) ---- */
+const API = 'api/v2/state';
 let sync = null, pushTimer = 0, pulling = false;
 const syncText = () => sync === 'ok' ? ' · Synced' : sync === 'offline' ? ' · Offline, saved on this device' : '';
 function setSync(v) { sync = v; const el = document.getElementById('sync'); if (el) el.textContent = syncText(); }
 const busy = () => { const a = document.activeElement; return drag || (a && (a.tagName === 'SELECT' || (a.tagName === 'INPUT' && (a.value || !a.closest('.add'))))); };
+function save() { try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) {} }
+
+/* Every day and plan carries its own edit time (u); deleted ids stay in S.gone with the deletion time.
+   normalize() and merge() must match the ones in server.py so both sides settle on the same list. */
+function normalize(s) {
+  const t = s.t || 0;
+  return {t, sample: !!s.sample, gone: {...(s.gone || {})},
+    days: s.days.map(d => ({...d, u: d.u ?? t})),
+    items: s.items.map((it, i) => ({...it, u: it.u ?? t, o: it.o ?? i}))};
+}
+function merge(a, b) {
+  a = normalize(a); b = normalize(b);
+  const gone = {...a.gone};
+  for (const [k, v] of Object.entries(b.gone)) if (v > (gone[k] || 0)) gone[k] = v;
+  const out = {gone, sample: (a.t >= b.t ? a : b).sample};
+  let t = Math.max(a.t, b.t, ...Object.values(gone));
+  for (const kind of ['days', 'items']) {
+    const best = new Map();
+    for (const r of [...a[kind], ...b[kind]]) { const c = best.get(r.id); if (!c || r.u > c.u) best.set(r.id, r); }
+    out[kind] = [...best.values()].filter(r => r.u > (gone[r.id] ?? -1));
+    out[kind].forEach(r => { if (r.u > t) t = r.u; });
+  }
+  const ids = new Set(out.days.map(d => d.id));
+  out.items = out.items.map(it => it.day && !ids.has(it.day) ? {...it, day: null} : it);
+  out.t = t;
+  return out;
+}
+function rec(r) { return JSON.stringify(r, Object.keys(r).sort()); }
+function sig(s) { return JSON.stringify([s.days.map(rec).sort(), s.items.map(rec).sort(), Object.entries(s.gone).sort()]); }
+// Converts a pre-merging copy L against the server copy R: records that match take the server's, records changed
+// here are stamped with L's last edit time, and records on only one side follow whichever copy is newer.
+function upgrade(L, R) {
+  const newer = L.t > R.t, out = {t: Math.max(L.t, R.t), sample: L.sample, gone: {...R.gone}, days: [], items: []};
+  const same = {days: (x, y) => x.date === y.date && x.type === y.type && (x.label || '') === (y.label || ''),
+                items: (x, y) => x.text === y.text && (x.day || null) === (y.day || null) && !!x.done === !!y.done};
+  for (const kind of ['days', 'items']) {
+    const theirs = new Map(R[kind].map(r => [r.id, r])), mine = new Set(L[kind].map(r => r.id));
+    L[kind].forEach((r, i) => {
+      const s = theirs.get(r.id);
+      if (s) out[kind].push(same[kind](r, s) ? s : {...s, ...r, u: L.t});
+      else if (newer) out[kind].push(kind === 'items' ? {...r, o: i, u: L.t} : {...r, u: L.t});
+    });
+    R[kind].forEach(s => { if (!mine.has(s.id)) { if (newer) out.gone[s.id] = Math.max(out.gone[s.id] || 0, L.t); else out[kind].push(s); } });
+  }
+  return out;
+}
 function adopt(R) {
   const f = document.activeElement && document.activeElement.closest && document.activeElement.closest('.add');
   if (f) refocus = f.dataset.day;
   S = R; undoSnap = null; toast.classList.remove('on');
-  try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) {}
+  save();
   render();
 }
 async function pull() {
@@ -205,12 +258,20 @@ async function pull() {
   pulling = true;
   try {
     const res = await fetch(API, {cache: 'no-store'});
-    if (!res.ok) { if (sync) setSync('offline'); return; }
+    if (!res.ok) { if (sync || res.status !== 404) setSync('offline'); return; }
     const R = (await res.json()).state;
     setSync('ok');
-    if (!R || S.t > R.t) push(0);
-    else if (R.t > S.t && !busy()) adopt(R);
-  } catch (e) { if (sync) setSync('offline'); }
+    if (legacy && R) {
+      const since = legacy.t, recent = r => r.u > since;
+      adopt(merge(upgrade(legacy, R), {t: S.t, days: S.days.filter(recent), items: S.items.filter(recent),
+        gone: Object.fromEntries(Object.entries(S.gone).filter(([, v]) => v > since))}));
+    }
+    legacy = null;
+    if (!R) return push(0);
+    const M = merge(R, S);
+    if (sig(M) !== sig(S) && !busy()) adopt(M);
+    if (sig(M) !== sig(R)) push(0);
+  } catch (e) { setSync('offline'); }
   finally { pulling = false; }
 }
 function push(delay = 400) {
@@ -219,8 +280,9 @@ function push(delay = 400) {
   pushTimer = setTimeout(async () => {
     try {
       const res = await fetch(API, {method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(S)});
-      if (res.status === 409) { const R = (await res.json()).state; if (R && R.t > S.t) adopt(R); }
-      else if (!res.ok) throw new Error(res.status);
+      if (!res.ok) throw new Error(res.status);
+      const M = merge((await res.json()).state, S);
+      if (sig(M) !== sig(S) && !busy()) adopt(M);
       setSync('ok');
     } catch (e) { setSync('offline'); }
   }, delay);
@@ -228,7 +290,7 @@ function push(delay = 400) {
 
 function commit(msg) {
   S.t = Date.now();
-  try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) {}
+  save();
   render();
   schedulePublish();
   push();
@@ -242,12 +304,19 @@ function showToast(msg) {
 }
 document.getElementById('undo').addEventListener('click', () => {
   if (!undoSnap) return;
-  S = JSON.parse(undoSnap); undoSnap = null; toast.classList.remove('on'); commit();
+  // Undo is recorded as new changes (fresh edit times, new deletions) so it wins when merged with other devices.
+  const old = JSON.parse(undoSnap), t = Date.now();
+  for (const kind of ['days', 'items']) {
+    const cur = new Map(S[kind].map(r => [r.id, r])), keep = new Set(old[kind].map(r => r.id));
+    S[kind].forEach(r => { if (!keep.has(r.id)) S.gone[r.id] = t; });
+    S[kind] = old[kind].map(r => { const c = cur.get(r.id); return c && rec(c) === rec(r) ? c : {...r, u: t}; });
+  }
+  undoSnap = null; toast.classList.remove('on'); commit();
 });
 
 function addDay(date, type, label) {
   if (S.days.some(d => d.date === date)) return false;
-  S.days.push({id: uid('d'), date, type, label}); return true;
+  S.days.push({id: uid('d'), date, type, label, u: Date.now()}); return true;
 }
 
 app.addEventListener('submit', e => {
@@ -260,7 +329,7 @@ app.addEventListener('submit', e => {
   }
   const t = f.t.value.trim(); if (!t) return;
   const day = f.dataset.day || null;
-  S.items.push({id: uid('i'), text: t, day}); S.sample = false;
+  S.items.push({id: uid('i'), text: t, day, o: nextO(day), u: Date.now()}); S.sample = false;
   refocus = f.dataset.day; commit();
 });
 
@@ -273,16 +342,17 @@ app.addEventListener('click', e => {
   const act = b.dataset.act, dayEl = b.closest('.day'), itEl = b.closest('.item');
   if (act === 'delitem') {
     snap(); const it = S.items.find(i => i.id === itEl.dataset.id);
-    S.items = S.items.filter(i => i !== it); commit('Deleted “' + it.text + '”');
+    kill('items', it.id); commit('Deleted “' + it.text + '”');
   } else if (act === 'toggleitem') {
-    const it = S.items.find(i => i.id === itEl.dataset.id); it.done = !it.done; commit();
+    const it = S.items.find(i => i.id === itEl.dataset.id); it.done = !it.done; touch(it); commit();
   } else if (act === 'delday') {
-    snap(); const id = dayEl.dataset.id, n = S.items.filter(i => i.day === id).length;
-    S.items.forEach(i => { if (i.day === id) i.day = null; });
-    S.days = S.days.filter(d => d.id !== id);
+    snap(); const id = dayEl.dataset.id, moved = S.items.filter(i => i.day === id), n = moved.length;
+    let o = nextO(null);
+    moved.forEach(i => { i.day = null; i.o = o++; touch(i); });
+    kill('days', id);
     commit('Day removed' + (n ? ` — ${n} plan${n === 1 ? '' : 's'} moved to Ideas` : ''));
   } else if (act === 'type') {
-    const d = S.days.find(x => x.id === dayEl.dataset.id); d.type = NEXT[d.type]; commit();
+    const d = S.days.find(x => x.id === dayEl.dataset.id); d.type = NEXT[d.type]; touch(d); commit();
   } else if (act === 'nextwk') {
     const d = today(); d.setDate(d.getDate() + ((6 - d.getDay() + 7) % 7));
     for (let k = 0; k < 104; k++, d.setDate(d.getDate() + 7)) {
@@ -291,7 +361,11 @@ app.addEventListener('click', e => {
       if (a || c) { S.sample = false; undoSnap = null; commit(); return; }
     }
   } else if (act === 'past') { showPast = !showPast; render(); }
-  else if (act === 'clear') { snap(); S.days = []; S.items = []; S.sample = false; commit('Cleared everything'); }
+  else if (act === 'clear') {
+    snap(); const t = Date.now();
+    [...S.days, ...S.items].forEach(r => { S.gone[r.id] = t; });
+    S.days = []; S.items = []; S.sample = false; commit('Cleared everything');
+  }
 });
 
 function editItem(li) {
@@ -300,7 +374,7 @@ function editItem(li) {
   const inp = document.createElement('input'); inp.value = it.text; inp.setAttribute('aria-label', 'Edit plan');
   span.replaceWith(inp); inp.focus(); inp.select();
   let done = false;
-  const finish = save => { if (done) return; done = true; const v = inp.value.trim(); if (save && v && v !== it.text) { it.text = v; commit(); } else render(); };
+  const finish = save => { if (done) return; done = true; const v = inp.value.trim(); if (save && v && v !== it.text) { it.text = v; touch(it); commit(); } else render(); };
   inp.addEventListener('keydown', e => { if (e.key === 'Enter') finish(true); if (e.key === 'Escape') finish(false); });
   inp.addEventListener('blur', () => finish(true));
 }
@@ -342,13 +416,12 @@ function endDrag() {
   justDragged = true; setTimeout(() => justDragged = false, 50);
   const id = d.li.dataset.id, list = d.li.closest('.list');
   const it = S.items.find(i => i.id === id);
-  const nextEl = d.li.nextElementSibling;
-  S.items = S.items.filter(i => i !== it);
+  // Only the moved plan changes: its order number lands between its new neighbours'.
+  const oOf = el => el ? S.items.find(i => i.id === el.dataset.id)?.o : undefined;
+  const prev = oOf(d.li.previousElementSibling), next = oOf(d.li.nextElementSibling);
   it.day = list.dataset.day || null;
-  let idx;
-  if (nextEl) idx = S.items.findIndex(i => i.id === nextEl.dataset.id);
-  else { idx = -1; S.items.forEach((i, k) => { if (i.day === it.day) idx = k + 1; }); if (idx < 0) idx = S.items.length; }
-  S.items.splice(idx, 0, it);
+  it.o = prev != null && next != null ? (prev + next) / 2 : prev != null ? prev + 1 : next != null ? next - 1 : 0;
+  touch(it);
   commit();
 }
 window.addEventListener('pointerup', endDrag);
@@ -360,12 +433,15 @@ if (window.claude && window.claude.use) window.claude.use('artifact').then(a => 
 pull();
 setInterval(() => { if (sync && document.visibilityState === 'visible') pull(); }, 5000);
 document.addEventListener('visibilitychange', () => { if (sync && document.visibilityState === 'visible') pull(); });
+window.addEventListener('online', () => pull());
 
 if ('serviceWorker' in navigator) {
   const hadController = !!navigator.serviceWorker.controller;
   navigator.serviceWorker.register('./sw.js').catch(() => {});
   navigator.serviceWorker.addEventListener('controllerchange', () => {
-    if (hadController) showToast('App updated — reload to get the latest.');
+    if (!hadController) return;
+    // Edits are already saved on the device, so a reload loses nothing.
+    if (busy()) showToast('App updated — reload to get the latest.'); else location.reload();
   });
 }
 }

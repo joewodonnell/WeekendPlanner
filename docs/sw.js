@@ -1,5 +1,5 @@
 // Bump VERSION whenever app files change so phones pick up the update.
-const VERSION = 'shell-2026-11-25-1';
+const VERSION = 'shell-2026-11-26-0';
 const SHELL = VERSION;
 const FONTS = 'fonts-v1';
 const ASSETS = [
@@ -30,7 +30,7 @@ self.addEventListener('fetch', (event) => {
   const url = new URL(req.url);
 
   if (url.origin === self.location.origin) {
-    if (url.pathname.endsWith('/api/state')) return;
+    if (url.pathname.includes('/api/')) return;
     event.respondWith(
       caches.open(SHELL).then(async (cache) => {
         const hit = await cache.match(req, { ignoreSearch: true });
