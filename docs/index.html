@@ -299,6 +299,7 @@ function commit(msg) {
 function snap() { undoSnap = JSON.stringify(S); }
 function showToast(msg) {
   document.getElementById('tmsg').textContent = msg;
+  document.getElementById('undo').style.display = undoSnap ? '' : 'none';
   toast.classList.add('on');
   clearTimeout(toastTimer); toastTimer = setTimeout(() => toast.classList.remove('on'), 6000);
 }
@@ -313,6 +314,22 @@ document.getElementById('undo').addEventListener('click', () => {
   }
   undoSnap = null; toast.classList.remove('on'); commit();
 });
+
+/* Plans left unfinished on a past day roll over to the next day that is today or later (or to Ideas if there is none). */
+function rollover() {
+  if (busy()) return;
+  const dates = new Map(S.days.map(d => [d.id, d.date]));
+  const late = S.items.filter(i => !i.done && i.day && dates.has(i.day) && diff(dates.get(i.day)) < 0);
+  if (!late.length) return;
+  const next = S.days.filter(d => diff(d.date) >= 0).sort((a, b) => a.date < b.date ? -1 : 1)[0];
+  const to = next ? next.id : null;
+  late.sort((a, b) => dates.get(a.day) < dates.get(b.day) ? -1 : dates.get(a.day) > dates.get(b.day) ? 1 : byOrder(a, b));
+  let o = nextO(to);
+  late.forEach(i => { i.day = to; i.o = o++; touch(i); });
+  undoSnap = null;
+  const n = late.length;
+  commit(`${n} unfinished plan${n === 1 ? '' : 's'} moved to ${next ? gTitle([next]) : 'Ideas'}`);
+}
 
 function addDay(date, type, label) {
   if (S.days.some(d => d.date === date)) return false;
@@ -428,11 +445,12 @@ window.addEventListener('pointerup', endDrag);
 window.addEventListener('pointercancel', endDrag);
 
 render();
+rollover();
 if (window.claude && window.claude.use) window.claude.use('artifact').then(a => { art = a; }).catch(() => {});
 
 pull();
-setInterval(() => { if (sync && document.visibilityState === 'visible') pull(); }, 5000);
-document.addEventListener('visibilitychange', () => { if (sync && document.visibilityState === 'visible') pull(); });
+setInterval(() => { if (document.visibilityState !== 'visible') return; rollover(); if (sync) pull(); }, 5000);
+document.addEventListener('visibilitychange', () => { if (document.visibilityState !== 'visible') return; rollover(); if (sync) pull(); });
 window.addEventListener('online', () => pull());
 
 if ('serviceWorker' in navigator) {
